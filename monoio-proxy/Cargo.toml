@@ -1,0 +1,18 @@
+[package]
+name = "monoio-proxy"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.75"
+bytes = "1.5.0"
+http = "0.2.9"
+monoio = "0.1.9"
+monoio-http = "0.2.3"
+monoio-http-client = "0.2.5"
+tower = { version = "0.4.13" }
+async-channel = "1.9.0"
+log = "0.4"
+pretty_env_logger = "0.5"
