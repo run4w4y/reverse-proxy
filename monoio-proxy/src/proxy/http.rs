@@ -10,13 +10,16 @@ use monoio::{
     io::Splitable,
     net::{ListenerConfig, TcpListener, TcpStream},
 };
-use monoio_http::common::body::StreamHint;
+use monoio_http::common::body::{StreamHint, HttpBody};
 use monoio_http::common::request::Request;
 use monoio_http::common::response::Response;
-use http::response;
+use http::{response, Uri};
 use monoio_http::h1::codec::ClientCodec;
+use monoio_http::h1::codec::decoder::RequestDecoder;
+use monoio_http::h1::codec::encoder::GenericEncoder;
 use monoio_http::h1::payload::{Payload, FixedPayload};
 use monoio_http::common::body::Body;
+use monoio_http_client::Client;
 use std::rc::Rc;
 use std::{future::Future, net::SocketAddr};
 use tower::{Service, ServiceBuilder};
@@ -41,68 +44,72 @@ impl Proxy for HttpProxy {
                 bail!("Error when binding to an address: {}", e);
             }
             let listener = Rc::new(listener.unwrap());
-            let (tx, rx) = async_channel::bounded(1);
-            let mut svc = ServiceBuilder::new()
-                .layer(H1CodecLayer {})
-                .service(TcpAcceptService);
-
+            // let (tx, rx) = async_channel::bounded(1);
+            let h1_client = monoio_http_client::Builder::new().http1_client().build();
+            
             loop {
-                let (mut decoder, mut encoder) = svc.call(listener.clone()).await.unwrap();
+                let accept = listener.accept().await;
 
-                match decoder.next().await {
-                    Some(Ok(req)) => {
-                        let req: Request<Payload> = req;
-                        let res = send_request(req).await;
-                        encoder.send_and_flush(res).await?;
+                match accept {
+                    Ok((mut conn, client_addr)) => {
+                        let (read, write) = conn.into_split();
+                        let mut decoder = RequestDecoder::new(read);
+                        let mut encoder = GenericEncoder::new(write);
+                        let client = h1_client.clone();
+                        
+                        monoio::spawn(async move {
+                            match decoder.next().await {
+                                Some(Ok(req)) => {
+                                    let req: Request<Payload> = req;
+                                    let res = send_request(client, req).await;
+                                    let _ = encoder.send_and_flush(res).await;
+                                }
+                                Some(Err(err)) => {
+                                    // TODO: fallback to tcp
+                                    log::warn!("{}", err);
+                                }
+                                None => {
+                                    log::info!("http client {} closed", client_addr);
+                                }
+                            }
+                        });
                     }
-                    Some(Err(err)) => {
-                        // TODO: fallback to tcp
-                        log::warn!("{}", err);
-                        break;
-                    }
-                    None => {
-                        // log::info!("http client {} closed", socketaddr);
-                        break;
+                    Err(_) => {
+                        log::warn!("failed to accept a connection");
                     }
                 }
             }
 
-            rx.close();
-            let _ = tx.send(()).await;
+            // rx.close();
+            // let _ = tx.send(()).await;
             Ok(())
         }
     }
 }
 
-async fn send_request(req: Request) -> Response {
-    let conn = monoio::net::TcpStream::connect("localhost:8000")
-        .await
-        .expect("unable to connect");
-    let mut codec = ClientCodec::new(conn);
+async fn send_request(client: Client, mut req: Request) -> Response<HttpBody> {
+    *req.uri_mut() = Uri::builder()
+        .scheme("http")
+        .authority("127.0.0.1:8000")
+        .path_and_query("")
+        .build()
+        .unwrap();
 
-    codec
-        .send_and_flush(req)
-        .await
-        .expect("unable to send request");
+    let resp = client.send_request(req).await.unwrap();
+    
+    resp
+    // let (parts, mut body) = resp.into_parts();
 
-    let builder = response::Builder::new();
+    // let mut body = resp.into_body().with_io(codec);
+    // if body.stream_hint() != StreamHint::Fixed {
+    //     panic!("unexpected body type");
+    // }
 
-    let resp = codec
-        .next()
-        .await
-        .expect("disconnected")
-        .expect("parse response failed");
+    // let data = body
+    //     .next_data()
+    //     .await
+    //     .unwrap()
+    //     .expect("unable to read response body");
 
-    let mut body = resp.into_body().with_io(codec);
-    if body.stream_hint() != StreamHint::Fixed {
-        panic!("unexpected body type");
-    }
-
-    let data = body
-        .next_data()
-        .await
-        .unwrap()
-        .expect("unable to read response body");
-
-    builder.body(Payload::Fixed(FixedPayload::new(data))).unwrap()
+    // builder.body(Payload::Fixed(FixedPayload::new(data))).unwrap()
 }
