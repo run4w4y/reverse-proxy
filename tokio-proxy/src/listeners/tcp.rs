@@ -46,7 +46,7 @@ pub trait Source<Req, S: Service<Req> + Send, RoutingReq> {
 
     async fn io_loop<
         UpstreamId: Eq + Hash + Debug + Clone + Send + Sync + 'static,
-        UpstreamKey: Eq + Hash + Clone + Send + Sync + 'static,
+        UpstreamKey: Eq + Hash + Debug + Clone + Send + Sync + 'static,
         RoutingS: Service<RoutingReq, Response = UpstreamId> + Clone + Send + Sync + 'static,
     >(
         self,
@@ -130,6 +130,51 @@ impl<Req, T: Copy + Send + 'static> Service<Req> for RouteAll<T> {
     }
 }
 
+#[derive(Debug)]
+pub struct ServiceChannelTransport<S, R> {
+    tx: mpsc::UnboundedSender<S>,
+    rx: mpsc::UnboundedReceiver<R>,
+}
+
+impl<S, R> ServiceChannelTransport<S, R> {
+    pub fn new_transport_pair() -> (ServiceChannelTransport<S, R>, ServiceChannelTransport<R, S>) {
+        let (tx1, rx1) = mpsc::unbounded_channel();
+        let (tx2, rx2) = mpsc::unbounded_channel();
+        let pair1 = ServiceChannelTransport { tx: tx1, rx: rx2 };
+        let pair2 = ServiceChannelTransport { tx: tx2, rx: rx1 };
+        (pair1, pair2)
+    }
+}
+
+impl<S, R> futures::Sink<S> for ServiceChannelTransport<S, R> {
+    type Error = SendError<S>;
+
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut std::task::Context) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn start_send(mut self: Pin<&mut Self>, item: S) -> Result<(), Self::Error> {
+        self.tx.send(item)?;
+        Ok(())
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut std::task::Context) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut std::task::Context) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl<S, R> futures::Stream for ServiceChannelTransport<S, R> {
+    type Item = Result<R, anyhow::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut std::task::Context) -> Poll<Option<Self::Item>> {
+        self.rx.poll_recv(cx).map(|i| i.map(Ok))
+    }
+}
+
 #[async_trait::async_trait]
 impl<
         A: ToSocketAddrs + Send + Sync + Clone + Display,
@@ -145,7 +190,7 @@ where
 
     async fn io_loop<
         UpstreamId: Eq + Hash + Debug + Clone + Send + Send + Sync + 'static,
-        UpstreamKey: Eq + Hash + Clone + Send + Sync + 'static,
+        UpstreamKey: Eq + Hash + Debug + Clone + Send + Sync + 'static,
         RoutingS: Service<SocketAddr, Response = UpstreamId> + Clone + Send + Sync + 'static,
     >(
         self,
@@ -232,21 +277,27 @@ where
                 }
                 SourceConfigProto::UpstreamAdd(id, key, svc) => {
                     // NOTE: be careful to not deadlock here
-                    match upstreams.read().await.get(&id) {
+                    let upstreams_rl = upstreams.read().await;
+                    match upstreams_rl.get(&id) {
                         Some((tx, _)) => {
                             tx.send(Ok(Change::Insert(key, svc))).unwrap();
                         }
                         None => {
+                            drop(upstreams_rl); // free the read lock before trying to acquire the write lock
+                            log::debug!("creating a new load balanced service for the upstream id={:?} key={:?}", id, key);
                             let mut upstreams = upstreams.write().await;
+                            log::debug!("got an upstreams write lock");
                             let (tx, rx) = mpsc::unbounded_channel::<
                                 Result<Change<UpstreamKey, S>, Infallible>,
                             >();
                             tx.send(Ok(Change::Insert(key, svc))).unwrap();
+                            let mut balanced_svc = p2c::Balance::new(Box::pin(UnboundedReceiverStream::new(rx)));
+                            poll_fn(|cx| balanced_svc.poll_ready(cx)).await.unwrap();
                             upstreams.insert(
                                 id,
                                 (
                                     tx,
-                                    p2c::Balance::new(Box::pin(UnboundedReceiverStream::new(rx))),
+                                    balanced_svc,
                                 ),
                             );
                         }
