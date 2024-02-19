@@ -4,9 +4,15 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Client, Request, Response, Server};
-use listeners::tcp::{Source, SourceConfig, TcpProxy, TcpSource};
+use listeners::tcp::{RouteAll, Source, SourceConfigProto, TcpProxy, TcpSource};
+use tower::load::{CompleteOnResponse, PendingRequests};
 
-type HttpClient = Client<hyper::client::HttpConnector>;
+// type HttpClient = Client<hyper::client::HttpConnector>;
+
+#[derive(PartialEq, Eq, Hash, Clone, Copy, Debug)]
+enum UpstreamId {
+    DefaultUpstream
+}
 
 // TODO: replace async_channel with tokio::sync::watch
 #[tokio::main]
@@ -16,16 +22,17 @@ async fn main() {
     // create the tcp listener  
     let listener = TcpSource::new("0.0.0.0:8080");
 
-    let proxy = TcpProxy {
-        target_addr: "127.0.0.1:8000"
-    };
-    let config = SourceConfig {
-        sink: listeners::tcp::Sink::SingleSink(proxy)
-    };
+    let proxy = PendingRequests::new(
+        TcpProxy::new("127.0.0.1:8000"), 
+        CompleteOnResponse::default()
+    );
 
-    let (tx, mut rx) = tokio::sync::watch::channel(config);
+    let (routing_tx, mut routing_rx) = tokio::sync::watch::channel(RouteAll::new(UpstreamId::DefaultUpstream));
+    let (proto_tx, mut proto_rx) = tokio::sync::mpsc::channel(10);
     
-    let fut = listener.io_loop(rx);
+    let fut = listener.io_loop(proto_rx, routing_rx);
+
+    proto_tx.send(SourceConfigProto::UpstreamAdd(UpstreamId::DefaultUpstream, "key", proxy)).await.unwrap();
     
     fut.await.unwrap();
 }
