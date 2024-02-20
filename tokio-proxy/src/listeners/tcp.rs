@@ -204,6 +204,20 @@ where
         let init_router_svc = routing_rx.borrow().clone();
         // NOTE: locks can be expensive, but for now i dont really see any workaround
         let router: Arc<RwLock<RoutingS>> = Arc::new(RwLock::new(init_router_svc));
+
+        // NOTE: i dont really like how this can throw if not polled for readiness
+        //       - although it makes complete sense as for why it does that it would be better to be in control of said readiness
+        // NOTE: a completely different approach is possible with a multitude of tcp listener polling tasks 
+        //       that await the proxy service calls internally
+        // NOTE: another approach similar to the one above would be to have a number of proxy service tasks
+        //       that would poll an mspc receiver and handle the incoming requests 
+        //       - i feel like thats the same thing as above but worse
+        //       - maybe do this but with tower::balance::pool somehow? worth looking into if out of other options
+        // TODO: try to implement this as a tokio-tower server and get rid of the nasty write locks in the listener polling task
+        //       - does it poll for readiness by itself? 
+        //       - can it be used in parallel? (how are the calls hanlded by the server)
+        //       - how expensive is creating a client for it?
+        //       - a consideration: a number of servers per service that all poll the same mspc receiver
         let upstreams: Arc<
             RwLock<
                 HashMap<
@@ -249,6 +263,8 @@ where
                             let upstream = upstreams.get_mut(&upstream_id);
                             match upstream {
                                 Some((_, ref mut svc)) => {
+                                    // the readiness polling below requires svc to be mutable as well
+                                    poll_fn(|cx| svc.poll_ready(cx)).await.unwrap();
                                     let res = svc.call((inbound, peer_addr)).await;
                                     if let Err(e) = res {
                                         log::error!("error when proxying: {}", e);
@@ -279,7 +295,9 @@ where
                     // NOTE: be careful to not deadlock here
                     let upstreams_rl = upstreams.read().await;
                     match upstreams_rl.get(&id) {
-                        Some((tx, _)) => {
+                        Some((tx, balanced_svc)) => {
+                            log::debug!("received a new upstream id={:?} key={:?}", id, key);
+                            // TODO: would be nice to poll for readiness right here
                             tx.send(Ok(Change::Insert(key, svc))).unwrap();
                         }
                         None => {

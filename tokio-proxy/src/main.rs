@@ -2,6 +2,7 @@ mod listeners;
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::time::Duration;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Client, Request, Response, Server};
 use listeners::tcp::{RouteAll, Source, SourceConfigProto, TcpProxy, TcpSource};
@@ -30,11 +31,20 @@ async fn main() {
     let (routing_tx, mut routing_rx) = tokio::sync::watch::channel(RouteAll::new(UpstreamId::DefaultUpstream));
     let (proto_tx, mut proto_rx) = tokio::sync::mpsc::channel(10);
     
-    let fut = listener.io_loop(proto_rx, routing_rx);
+    let fut = tokio::spawn(listener.io_loop(proto_rx, routing_rx));
 
     proto_tx.send(SourceConfigProto::UpstreamAdd(UpstreamId::DefaultUpstream, "key", proxy)).await.unwrap();
+
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    let another_proxy = PendingRequests::new(
+        TcpProxy::new("127.0.0.1:8888"),
+        CompleteOnResponse::default()
+    );
+
+    proto_tx.send(SourceConfigProto::UpstreamAdd(UpstreamId::DefaultUpstream, "another-key", another_proxy)).await.unwrap();
     
-    fut.await.unwrap();
+    fut.await.unwrap().unwrap();
 }
 
 // #[tokio::main]
