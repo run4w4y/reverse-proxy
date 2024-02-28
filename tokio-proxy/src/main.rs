@@ -15,7 +15,6 @@ enum UpstreamId {
     DefaultUpstream
 }
 
-// TODO: replace async_channel with tokio::sync::watch
 #[tokio::main]
 async fn main() {
     pretty_env_logger::init();

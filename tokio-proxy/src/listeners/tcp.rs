@@ -1,10 +1,9 @@
 use std::{
-    collections::HashMap,
     convert::Infallible,
     error::Error,
     fmt::{Debug, Display},
     hash::Hash,
-    net::SocketAddr,
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     pin::Pin,
     sync::Arc,
     task::Poll,
@@ -14,9 +13,11 @@ use futures::{
     channel::mpsc::UnboundedReceiver,
     future::{self, poll_fn},
     pin_mut, Future, Stream, StreamExt, TryStream,
+    TryFutureExt
 };
+use slab::Slab;
 use tokio::{
-    io::copy_bidirectional,
+    io::{copy_bidirectional, AsyncWriteExt},
     net::{TcpStream, ToSocketAddrs},
     sync::{
         mpsc::{self, error::SendError},
@@ -24,11 +25,12 @@ use tokio::{
     },
 };
 use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_tower::multiplex::{self, TagStore};
 use tower::{
-    balance::p2c,
+    balance::{self, p2c},
     discover::{Change, Discover, ServiceList},
     load::Load,
-    BoxError, Service,
+    BoxError, Service, ServiceExt
 };
 
 #[derive(Debug, Clone)]
@@ -37,8 +39,6 @@ pub enum SourceConfigProto<UpstreamId, UpstreamKey, UpstreamService> {
     UpstreamAdd(UpstreamId, UpstreamKey, UpstreamService),
     UpstreamRemove(UpstreamId, UpstreamKey),
 }
-
-pub type TcpAccept = (TcpStream, SocketAddr);
 
 #[async_trait::async_trait]
 pub trait Source<Req, S: Service<Req> + Send, RoutingReq> {
@@ -54,7 +54,7 @@ pub trait Source<Req, S: Service<Req> + Send, RoutingReq> {
         routing_rx: watch::Receiver<RoutingS>,
     ) -> Result<(), Self::Error>
     where
-        RoutingS::Error: Send + Display,
+        RoutingS::Error: Send + Display + Debug,
         RoutingS::Future: Send;
 }
 
@@ -80,9 +80,11 @@ impl<A> TcpProxy<A> {
     }
 }
 
-impl<A: ToSocketAddrs + Copy + Send + Debug + 'static> Service<TcpAccept> for TcpProxy<A> {
+impl<A: ToSocketAddrs + Copy + Send + Debug + 'static, Tag: Send + 'static> Service<TcpAccept<Tag>>
+    for TcpProxy<A>
+{
     type Error = std::io::Error;
-    type Response = (u64, u64);
+    type Response = TcpTransferReponse<Tag>;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     fn poll_ready(
@@ -92,12 +94,16 @@ impl<A: ToSocketAddrs + Copy + Send + Debug + 'static> Service<TcpAccept> for Tc
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, (mut inbound, peer_addr): TcpAccept) -> Self::Future {
+    fn call(&mut self, accept: TcpAccept<Tag>) -> Self::Future {
         let addr = self.target_addr.clone();
         Box::pin(async move {
-            log::debug!("proxying tcp traffic from {:?} to {:?}", peer_addr, addr);
+            let mut inbound = accept.stream;
+            log::debug!("proxying tcp traffic from {:?} to {:?}", accept.addr, addr);
             let mut outbound = TcpStream::connect(addr).await?;
-            copy_bidirectional(&mut inbound, &mut outbound).await
+            let res = copy_bidirectional(&mut inbound, &mut outbound).await?;
+            inbound.shutdown().await?;
+            outbound.shutdown().await?;
+            Ok(TcpTransferReponse::new(res, accept.tag))
         })
     }
 }
@@ -149,7 +155,10 @@ impl<S, R> ServiceChannelTransport<S, R> {
 impl<S, R> futures::Sink<S> for ServiceChannelTransport<S, R> {
     type Error = SendError<S>;
 
-    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut std::task::Context) -> Poll<Result<(), Self::Error>> {
+    fn poll_ready(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context,
+    ) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
     }
 
@@ -158,11 +167,17 @@ impl<S, R> futures::Sink<S> for ServiceChannelTransport<S, R> {
         Ok(())
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut std::task::Context) -> Poll<Result<(), Self::Error>> {
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context,
+    ) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_close(self: Pin<&mut Self>, cx: &mut std::task::Context) -> Poll<Result<(), Self::Error>> {
+    fn poll_close(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context,
+    ) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
     }
 }
@@ -170,26 +185,90 @@ impl<S, R> futures::Sink<S> for ServiceChannelTransport<S, R> {
 impl<S, R> futures::Stream for ServiceChannelTransport<S, R> {
     type Item = Result<R, anyhow::Error>;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut std::task::Context) -> Poll<Option<Self::Item>> {
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context,
+    ) -> Poll<Option<Self::Item>> {
         self.rx.poll_recv(cx).map(|i| i.map(Ok))
+    }
+}
+
+pub trait Tagged<T> {
+    fn get_tag(&self) -> &T;
+}
+
+pub trait Taggable<T> {
+    fn set_tag(&mut self, tag: T) -> ();
+}
+
+pub(crate) struct SlabStore(Slab<()>);
+
+impl SlabStore {
+    pub fn new() -> Self {
+        SlabStore(Slab::new())
+    }
+}
+
+impl<Req: Taggable<usize>, Res: Tagged<usize>> TagStore<Req, Res> for SlabStore {
+    type Tag = usize;
+
+    fn assign_tag(mut self: Pin<&mut Self>, request: &mut Req) -> usize {
+        let tag = self.0.insert(());
+        request.set_tag(tag);
+        tag
+    }
+
+    fn finish_tag(mut self: Pin<&mut Self>, response: &Res) -> usize {
+        let tag = response.get_tag();
+        self.0.remove(*tag);
+        *tag
+    }
+}
+
+pub struct TcpAccept<Tag> {
+    stream: TcpStream,
+    addr: SocketAddr,
+    tag: Tag,
+}
+
+impl<Tag> Taggable<Tag> for TcpAccept<Tag> {
+    fn set_tag(&mut self, tag: Tag) -> () {
+        self.tag = tag;
+    }
+}
+
+pub struct TcpTransferReponse<Tag> {
+    res: (u64, u64),
+    tag: Tag,
+}
+
+impl<Tag> TcpTransferReponse<Tag> {
+    fn new(res: (u64, u64), tag: Tag) -> Self {
+        TcpTransferReponse { res, tag }
+    }
+}
+
+impl<Tag> Tagged<Tag> for TcpTransferReponse<Tag> {
+    fn get_tag(&self) -> &Tag {
+        &self.tag
     }
 }
 
 #[async_trait::async_trait]
 impl<
         A: ToSocketAddrs + Send + Sync + Clone + Display,
-        S: Service<TcpAccept> + Load + Send + Sync + 'static,
-    > Source<TcpAccept, S, SocketAddr> for TcpSource<A>
+        S: Service<TcpAccept<usize>> + Load + Send + Sync + 'static,
+    > Source<TcpAccept<usize>, S, SocketAddr> for TcpSource<A>
 where
-    S::Error: Send + Sync + Error + Into<BoxError>,
-    S::Response: Send,
+    S::Error: Send + Sync + Error + Into<BoxError> + Debug,
+    S::Response: Send + Tagged<usize>,
     S::Future: Send,
     <S as Load>::Metric: Debug,
 {
     type Error = anyhow::Error;
 
     async fn io_loop<
-        UpstreamId: Eq + Hash + Debug + Clone + Send + Send + Sync + 'static,
+        UpstreamId: Eq + Hash + Debug + Clone + Send + Sync + 'static,
         UpstreamKey: Eq + Hash + Debug + Clone + Send + Sync + 'static,
         RoutingS: Service<SocketAddr, Response = UpstreamId> + Clone + Send + Sync + 'static,
     >(
@@ -198,46 +277,45 @@ where
         mut routing_rx: watch::Receiver<RoutingS>,
     ) -> Result<(), Self::Error>
     where
-        RoutingS::Error: Send + Display,
+        RoutingS::Error: Send + Display + Debug,
         RoutingS::Future: Send,
     {
         let init_router_svc = routing_rx.borrow().clone();
         // NOTE: locks can be expensive, but for now i dont really see any workaround
         let router: Arc<RwLock<RoutingS>> = Arc::new(RwLock::new(init_router_svc));
+        let tag_store = SlabStore::new();
 
         // NOTE: i dont really like how this can throw if not polled for readiness
         //       - although it makes complete sense as for why it does that it would be better to be in control of said readiness
-        // NOTE: a completely different approach is possible with a multitude of tcp listener polling tasks 
+        // NOTE: a completely different approach is possible with a multitude of tcp listener polling tasks
         //       that await the proxy service calls internally
         // NOTE: another approach similar to the one above would be to have a number of proxy service tasks
-        //       that would poll an mspc receiver and handle the incoming requests 
+        //       that would poll an mspc receiver and handle the incoming requests
         //       - i feel like thats the same thing as above but worse
         //       - maybe do this but with tower::balance::pool somehow? worth looking into if out of other options
         // TODO: try to implement this as a tokio-tower server and get rid of the nasty write locks in the listener polling task
-        //       - does it poll for readiness by itself? 
+        //       - does it poll for readiness by itself?
         //       - can it be used in parallel? (how are the calls hanlded by the server)
         //       - how expensive is creating a client for it?
         //       - a consideration: a number of servers per service that all poll the same mspc receiver
+
         let upstreams: Arc<
-            RwLock<
-                HashMap<
-                    UpstreamId,
-                    (
-                        mpsc::UnboundedSender<Result<Change<UpstreamKey, S>, Infallible>>,
-                        p2c::Balance<
-                            Pin<
-                                Box<
-                                    UnboundedReceiverStream<
-                                        Result<Change<UpstreamKey, S>, Infallible>,
-                                    >,
-                                >,
+            scc::HashMap<
+                UpstreamId,
+                (
+                    mpsc::UnboundedSender<Result<Change<UpstreamKey, S>, Infallible>>,
+                    p2c::Balance<
+                        Pin<
+                            Box<
+                                UnboundedReceiverStream<Result<Change<UpstreamKey, S>, Infallible>>,
                             >,
-                            TcpAccept,
                         >,
-                    ),
-                >,
+                        TcpAccept<usize>,
+                    >,
+                ),
             >,
-        > = Arc::new(RwLock::new(HashMap::new()));
+        > = Arc::new(scc::HashMap::new());
+
         let listener = tokio::net::TcpListener::bind(&self.listen_addr).await?;
         log::info!("Listener started on {}", self.listen_addr);
 
@@ -254,18 +332,25 @@ where
                 let upstreams_ = upstreams.clone();
                 tokio::spawn(async move {
                     let mut router = router_.write().await; // TODO: i really dont like this write borrow here
+                    let upstream_resolve_fut = router.ready().await.unwrap().call(peer_addr);
+                    drop(router);
 
-                    match router.call(peer_addr).await {
+                    match upstream_resolve_fut.await {
                         Ok(upstream_id) => {
                             log::debug!("resolved the upstream id to: {:?}", upstream_id);
-                            let mut upstreams = upstreams_.write().await;
-                            log::debug!("got the write lock");
-                            let upstream = upstreams.get_mut(&upstream_id);
+                            let upstream = upstreams_.get_async(&upstream_id).await;
                             match upstream {
-                                Some((_, ref mut svc)) => {
+                                Some(mut entry) => {
+                                    let (_, ref mut svc) = *entry.get_mut();
                                     // the readiness polling below requires svc to be mutable as well
-                                    poll_fn(|cx| svc.poll_ready(cx)).await.unwrap();
-                                    let res = svc.call((inbound, peer_addr)).await;
+                                    svc.ready().await.unwrap();
+                                    let res = svc
+                                        .call(TcpAccept {
+                                            stream: inbound,
+                                            addr: peer_addr,
+                                            tag: 0,
+                                        })
+                                        .await;
                                     if let Err(e) = res {
                                         log::error!("error when proxying: {}", e);
                                     }
@@ -293,38 +378,31 @@ where
                 }
                 SourceConfigProto::UpstreamAdd(id, key, svc) => {
                     // NOTE: be careful to not deadlock here
-                    let upstreams_rl = upstreams.read().await;
-                    match upstreams_rl.get(&id) {
-                        Some((tx, balanced_svc)) => {
+                    match upstreams.get_async(&id).await {
+                        Some(entry) => {
+                            let (tx, _client) = entry.get();
                             log::debug!("received a new upstream id={:?} key={:?}", id, key);
-                            // TODO: would be nice to poll for readiness right here
                             tx.send(Ok(Change::Insert(key, svc))).unwrap();
                         }
                         None => {
-                            drop(upstreams_rl); // free the read lock before trying to acquire the write lock
                             log::debug!("creating a new load balanced service for the upstream id={:?} key={:?}", id, key);
-                            let mut upstreams = upstreams.write().await;
-                            log::debug!("got an upstreams write lock");
                             let (tx, rx) = mpsc::unbounded_channel::<
                                 Result<Change<UpstreamKey, S>, Infallible>,
                             >();
                             tx.send(Ok(Change::Insert(key, svc))).unwrap();
-                            let mut balanced_svc = p2c::Balance::new(Box::pin(UnboundedReceiverStream::new(rx)));
-                            poll_fn(|cx| balanced_svc.poll_ready(cx)).await.unwrap();
-                            upstreams.insert(
-                                id,
-                                (
-                                    tx,
-                                    balanced_svc,
-                                ),
-                            );
+
+                            let balanced_svc =
+                                p2c::Balance::new(Box::pin(UnboundedReceiverStream::new(rx)));
+
+                            upstreams.insert_async(id, (tx, balanced_svc)).await;
                         }
                     }
                 }
                 SourceConfigProto::UpstreamRemove(id, key) => {
-                    match upstreams.read().await.get(&id) {
-                        Some((tx, _)) => {
-                            tx.send(Ok(Change::Remove(key)));
+                    match upstreams.get_async(&id).await {
+                        Some(entry) => {
+                            let (tx, _client) = entry.get();
+                            tx.send(Ok(Change::Remove(key))).unwrap();
                         }
                         None => {
                             log::warn!("No upstream found with the id: {:?}", id);
