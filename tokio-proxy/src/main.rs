@@ -20,30 +20,11 @@ async fn main() {
     pretty_env_logger::init();
 
     // create the tcp listener  
-    let listener = TcpSource::new("0.0.0.0:8080");
+    let srv = TcpSource::new("0.0.0.0:8080");
 
-    let proxy = PendingRequests::new(
-        TcpProxy::new("127.0.0.1:8000"), 
-        CompleteOnResponse::default()
-    );
+    let proxy = TcpProxy::new("127.0.0.1:8000");
 
-    let (routing_tx, mut routing_rx) = tokio::sync::watch::channel(RouteAll::new(UpstreamId::DefaultUpstream));
-    let (proto_tx, mut proto_rx) = tokio::sync::mpsc::channel(10);
-    
-    let fut = tokio::spawn(listener.io_loop(proto_rx, routing_rx));
-
-    proto_tx.send(SourceConfigProto::UpstreamAdd(UpstreamId::DefaultUpstream, "key", proxy)).await.unwrap();
-
-    tokio::time::sleep(Duration::from_secs(10)).await;
-
-    let another_proxy = PendingRequests::new(
-        TcpProxy::new("127.0.0.1:8888"),
-        CompleteOnResponse::default()
-    );
-
-    proto_tx.send(SourceConfigProto::UpstreamAdd(UpstreamId::DefaultUpstream, "another-key", another_proxy)).await.unwrap();
-    
-    fut.await.unwrap().unwrap();
+    srv.io_loop(proxy.into_make_service()).await.unwrap();
 }
 
 // #[tokio::main]

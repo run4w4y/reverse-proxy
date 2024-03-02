@@ -12,9 +12,9 @@ use std::{
 use futures::{
     channel::mpsc::UnboundedReceiver,
     future::{self, poll_fn},
-    pin_mut, Future, Stream, StreamExt, TryStream,
-    TryFutureExt
+    pin_mut, Future, FutureExt, Stream, StreamExt, TryFutureExt, TryStream,
 };
+use scc::hash_map::{Entry, OccupiedEntry};
 use slab::Slab;
 use tokio::{
     io::{copy_bidirectional, AsyncWriteExt},
@@ -29,8 +29,9 @@ use tokio_tower::multiplex::{self, TagStore};
 use tower::{
     balance::{self, p2c},
     discover::{Change, Discover, ServiceList},
-    load::Load,
-    BoxError, Service, ServiceExt
+    load::{CompleteOnResponse, Load, PendingRequests},
+    make::Shared,
+    BoxError, Layer, MakeService, Service, ServiceBuilder, ServiceExt,
 };
 
 #[derive(Debug, Clone)]
@@ -74,9 +75,37 @@ pub struct TcpProxy<A> {
     pub target_addr: A,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct IntoMakeTcpProxy<A> {
+    inner: TcpProxy<A>,
+}
+
 impl<A> TcpProxy<A> {
     pub fn new(target_addr: A) -> Self {
         TcpProxy { target_addr }
+    }
+
+    pub fn into_make_service(self) -> IntoMakeTcpProxy<A> {
+        IntoMakeTcpProxy { inner: self }
+    }
+}
+
+impl<A: ToSocketAddrs + Copy + Send + Sync + 'static> Service<()> for IntoMakeTcpProxy<A> {
+    type Response = TcpProxy<A>;
+    type Error = Infallible;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + Sync>>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, target: ()) -> Self::Future {
+        Box::pin(future::ready(Ok(TcpProxy {
+            target_addr: self.inner.target_addr,
+        })))
     }
 }
 
@@ -101,8 +130,8 @@ impl<A: ToSocketAddrs + Copy + Send + Debug + 'static, Tag: Send + 'static> Serv
             log::debug!("proxying tcp traffic from {:?} to {:?}", accept.addr, addr);
             let mut outbound = TcpStream::connect(addr).await?;
             let res = copy_bidirectional(&mut inbound, &mut outbound).await?;
-            inbound.shutdown().await?;
-            outbound.shutdown().await?;
+            let _ = inbound.shutdown().await; // its probably fine if i dont do that
+            let _ = outbound.shutdown().await;
             Ok(TcpTransferReponse::new(res, accept.tag))
         })
     }
@@ -116,6 +145,34 @@ pub struct RouteAll<T> {
 impl<T> RouteAll<T> {
     pub fn new(upstream: T) -> Self {
         RouteAll { upstream }
+    }
+
+    pub fn into_make_service(self) -> IntoMakeRouteAll<T> {
+        IntoMakeRouteAll { inner: self }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct IntoMakeRouteAll<T> {
+    inner: RouteAll<T>,
+}
+
+impl<T: Copy + Send + 'static> Service<()> for IntoMakeRouteAll<T> {
+    type Response = RouteAll<T>;
+    type Error = Infallible;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, target: ()) -> Self::Future {
+        Box::pin(future::ready(Ok(RouteAll {
+            upstream: self.inner.upstream,
+        })))
     }
 }
 
@@ -136,105 +193,14 @@ impl<Req, T: Copy + Send + 'static> Service<Req> for RouteAll<T> {
     }
 }
 
-#[derive(Debug)]
-pub struct ServiceChannelTransport<S, R> {
-    tx: mpsc::UnboundedSender<S>,
-    rx: mpsc::UnboundedReceiver<R>,
-}
-
-impl<S, R> ServiceChannelTransport<S, R> {
-    pub fn new_transport_pair() -> (ServiceChannelTransport<S, R>, ServiceChannelTransport<R, S>) {
-        let (tx1, rx1) = mpsc::unbounded_channel();
-        let (tx2, rx2) = mpsc::unbounded_channel();
-        let pair1 = ServiceChannelTransport { tx: tx1, rx: rx2 };
-        let pair2 = ServiceChannelTransport { tx: tx2, rx: rx1 };
-        (pair1, pair2)
-    }
-}
-
-impl<S, R> futures::Sink<S> for ServiceChannelTransport<S, R> {
-    type Error = SendError<S>;
-
-    fn poll_ready(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context,
-    ) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn start_send(mut self: Pin<&mut Self>, item: S) -> Result<(), Self::Error> {
-        self.tx.send(item)?;
-        Ok(())
-    }
-
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context,
-    ) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_close(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context,
-    ) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-}
-
-impl<S, R> futures::Stream for ServiceChannelTransport<S, R> {
-    type Item = Result<R, anyhow::Error>;
-
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context,
-    ) -> Poll<Option<Self::Item>> {
-        self.rx.poll_recv(cx).map(|i| i.map(Ok))
-    }
-}
-
 pub trait Tagged<T> {
-    fn get_tag(&self) -> &T;
-}
-
-pub trait Taggable<T> {
-    fn set_tag(&mut self, tag: T) -> ();
-}
-
-pub(crate) struct SlabStore(Slab<()>);
-
-impl SlabStore {
-    pub fn new() -> Self {
-        SlabStore(Slab::new())
-    }
-}
-
-impl<Req: Taggable<usize>, Res: Tagged<usize>> TagStore<Req, Res> for SlabStore {
-    type Tag = usize;
-
-    fn assign_tag(mut self: Pin<&mut Self>, request: &mut Req) -> usize {
-        let tag = self.0.insert(());
-        request.set_tag(tag);
-        tag
-    }
-
-    fn finish_tag(mut self: Pin<&mut Self>, response: &Res) -> usize {
-        let tag = response.get_tag();
-        self.0.remove(*tag);
-        *tag
-    }
+    fn get_tag(&self) -> T;
 }
 
 pub struct TcpAccept<Tag> {
     stream: TcpStream,
     addr: SocketAddr,
     tag: Tag,
-}
-
-impl<Tag> Taggable<Tag> for TcpAccept<Tag> {
-    fn set_tag(&mut self, tag: Tag) -> () {
-        self.tag = tag;
-    }
 }
 
 pub struct TcpTransferReponse<Tag> {
@@ -248,171 +214,135 @@ impl<Tag> TcpTransferReponse<Tag> {
     }
 }
 
-impl<Tag> Tagged<Tag> for TcpTransferReponse<Tag> {
-    fn get_tag(&self) -> &Tag {
-        &self.tag
+impl<Tag: Copy> Tagged<Tag> for TcpTransferReponse<Tag> {
+    fn get_tag(&self) -> Tag {
+        self.tag
     }
 }
 
-#[async_trait::async_trait]
-impl<
-        A: ToSocketAddrs + Send + Sync + Clone + Display,
-        S: Service<TcpAccept<usize>> + Load + Send + Sync + 'static,
-    > Source<TcpAccept<usize>, S, SocketAddr> for TcpSource<A>
-where
-    S::Error: Send + Sync + Error + Into<BoxError> + Debug,
-    S::Response: Send + Tagged<usize>,
-    S::Future: Send,
-    <S as Load>::Metric: Debug,
-{
-    type Error = anyhow::Error;
+struct SelectUpstreamService<'a, S, K: Eq + Hash, V> {
+    upstreams: &'a scc::HashMap<K, V>,
+    service: S,
+}
 
-    async fn io_loop<
-        UpstreamId: Eq + Hash + Debug + Clone + Send + Sync + 'static,
-        UpstreamKey: Eq + Hash + Debug + Clone + Send + Sync + 'static,
-        RoutingS: Service<SocketAddr, Response = UpstreamId> + Clone + Send + Sync + 'static,
+impl<'a, Req, S: Service<Req, Response = K>, K: Eq + Hash + Send + Sync, V: Sync> Service<Req>
+    for SelectUpstreamService<'a, S, K, V>
+where
+    S::Error: Send + Sync + Error + 'a,
+    S::Future: Send + 'a,
+{
+    type Response = Entry<'a, K, V>;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'a>>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.service.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: Req) -> Self::Future {
+        let fut = self
+            .service
+            .call(req)
+            .and_then(|res| self.upstreams.entry_async(res).map(Ok));
+        Box::pin(fut)
+    }
+}
+
+struct SelectUpstreamLayer<'a, K: Eq + Hash, V> {
+    upstreams: &'a scc::HashMap<K, V>,
+}
+
+impl<'a, K: Eq + Hash, V> SelectUpstreamLayer<'a, K, V> {
+    pub fn new(upstreams: &'a scc::HashMap<K, V>) -> Self {
+        SelectUpstreamLayer { upstreams }
+    }
+}
+
+impl<'a, S, K: Eq + Hash, V> Layer<S> for SelectUpstreamLayer<'a, K, V> {
+    type Service = SelectUpstreamService<'a, S, K, V>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        SelectUpstreamService {
+            service: inner,
+            upstreams: self.upstreams,
+        }
+    }
+}
+
+#[derive(PartialEq, Eq, Hash, Clone, Copy, Debug)]
+enum UpstreamId {
+    DefaultUpstream,
+}
+
+impl<A: ToSocketAddrs + Display> TcpSource<A> {
+    pub async fn io_loop<
+        MakeProxy: Service<()> + MakeService<(), TcpAccept<usize>> + Send + Sync + 'static,
     >(
         self,
-        mut proto_rx: mpsc::Receiver<SourceConfigProto<UpstreamId, UpstreamKey, S>>,
-        mut routing_rx: watch::Receiver<RoutingS>,
-    ) -> Result<(), Self::Error>
+        mut make_proxy: MakeProxy,
+    ) -> Result<(), anyhow::Error>
     where
-        RoutingS::Error: Send + Display + Debug,
-        RoutingS::Future: Send,
+        <MakeProxy as Service<()>>::Error: Send + Sync + Error,
+        <MakeProxy as Service<()>>::Response: Service<TcpAccept<usize>> + Send,
+        <<MakeProxy as Service<()>>::Response as Service<TcpAccept<usize>>>::Error:
+            Send + Sync + Debug,
+        <MakeProxy as Service<()>>::Future: Send + Sync,
+        <<MakeProxy as Service<()>>::Response as Service<TcpAccept<usize>>>::Future: Send,
     {
-        let init_router_svc = routing_rx.borrow().clone();
-        // NOTE: locks can be expensive, but for now i dont really see any workaround
-        let router: Arc<RwLock<RoutingS>> = Arc::new(RwLock::new(init_router_svc));
-        let tag_store = SlabStore::new();
+        let mut make_router = RouteAll::new(UpstreamId::DefaultUpstream).into_make_service();
 
-        // NOTE: i dont really like how this can throw if not polled for readiness
-        //       - although it makes complete sense as for why it does that it would be better to be in control of said readiness
-        // NOTE: a completely different approach is possible with a multitude of tcp listener polling tasks
-        //       that await the proxy service calls internally
-        // NOTE: another approach similar to the one above would be to have a number of proxy service tasks
-        //       that would poll an mspc receiver and handle the incoming requests
-        //       - i feel like thats the same thing as above but worse
-        //       - maybe do this but with tower::balance::pool somehow? worth looking into if out of other options
-        // TODO: try to implement this as a tokio-tower server and get rid of the nasty write locks in the listener polling task
-        //       - does it poll for readiness by itself?
-        //       - can it be used in parallel? (how are the calls hanlded by the server)
-        //       - how expensive is creating a client for it?
-        //       - a consideration: a number of servers per service that all poll the same mspc receiver
+        let upstreams = Box::new(scc::HashMap::new());
+        let upstreams_ref = Box::leak::<'static>(upstreams);
 
-        let upstreams: Arc<
-            scc::HashMap<
-                UpstreamId,
-                (
-                    mpsc::UnboundedSender<Result<Change<UpstreamKey, S>, Infallible>>,
-                    p2c::Balance<
-                        Pin<
-                            Box<
-                                UnboundedReceiverStream<Result<Change<UpstreamKey, S>, Infallible>>,
-                            >,
-                        >,
-                        TcpAccept<usize>,
-                    >,
-                ),
-            >,
-        > = Arc::new(scc::HashMap::new());
+        let mut balanced_make_proxy = p2c::Balance::new(ServiceList::new(vec![
+            PendingRequests::new(make_proxy, CompleteOnResponse::default()), // this is pretty wrong, since the load handler (?) should be dropped only after the produced service responds
+        ]));
+
+        upstreams_ref.insert(UpstreamId::DefaultUpstream, balanced_make_proxy);
 
         let listener = tokio::net::TcpListener::bind(&self.listen_addr).await?;
         log::info!("Listener started on {}", self.listen_addr);
 
-        let router_ = router.clone();
-        let upstreams_ = upstreams.clone();
-        // NOTE: might want to make it unbounded
-        let proxy_handle = tokio::task::spawn(async move {
-            let router = router_;
-            let upstreams = upstreams_;
+        let handle = tokio::task::spawn(async move {
             while let Ok((inbound, peer_addr)) = listener.accept().await {
-                log::debug!("Accepted TCP connection from: {}", peer_addr);
+                let accept = TcpAccept {
+                    stream: inbound,
+                    addr: peer_addr,
+                    tag: 0,
+                };
 
-                let router_ = router.clone();
-                let upstreams_ = upstreams.clone();
+                let mut router = make_router.call(()).await.unwrap();
+                let mut route_to_proxy = ServiceBuilder::new()
+                    .layer(SelectUpstreamLayer::new(upstreams_ref))
+                    .service(router);
+                let entry_fut = route_to_proxy.call(peer_addr);
+
                 tokio::spawn(async move {
-                    let mut router = router_.write().await; // TODO: i really dont like this write borrow here
-                    let upstream_resolve_fut = router.ready().await.unwrap().call(peer_addr);
-                    drop(router);
+                    let entry = entry_fut.await.unwrap();
 
-                    match upstream_resolve_fut.await {
-                        Ok(upstream_id) => {
-                            log::debug!("resolved the upstream id to: {:?}", upstream_id);
-                            let upstream = upstreams_.get_async(&upstream_id).await;
-                            match upstream {
-                                Some(mut entry) => {
-                                    let (_, ref mut svc) = *entry.get_mut();
-                                    // the readiness polling below requires svc to be mutable as well
-                                    svc.ready().await.unwrap();
-                                    let res = svc
-                                        .call(TcpAccept {
-                                            stream: inbound,
-                                            addr: peer_addr,
-                                            tag: 0,
-                                        })
-                                        .await;
-                                    if let Err(e) = res {
-                                        log::error!("error when proxying: {}", e);
-                                    }
-                                }
-                                None => {
-                                    log::error!(
-                                        "no active services found for upstream {:?}",
-                                        upstream_id
-                                    );
-                                }
-                            }
+                    match entry {
+                        Entry::Vacant(entry) => {
+                            log::error!("no upstream found for: {:?}:", entry.key());
                         }
-                        Err(e) => {
-                            log::error!("failed resolving an upstream: {}", e);
+                        Entry::Occupied(mut make_proxy_entry) => {
+                            let make_proxy = make_proxy_entry.get_mut();
+                            let proxy_fut = make_proxy.ready().await.unwrap().call(());
+                            drop(make_proxy);
+                            drop(make_proxy_entry);
+                            let mut proxy = proxy_fut.await.unwrap();
+                            if let Err(e) = proxy.ready().await.unwrap().call(accept).await {
+                                log::error!("error when proxying: {:?}", e);
+                            }
                         }
                     }
                 });
             }
         });
 
-        while let Some(msg) = proto_rx.recv().await {
-            match msg {
-                SourceConfigProto::Shutdown => {
-                    log::error!("graceful shutdown not yet implemented");
-                }
-                SourceConfigProto::UpstreamAdd(id, key, svc) => {
-                    // NOTE: be careful to not deadlock here
-                    match upstreams.get_async(&id).await {
-                        Some(entry) => {
-                            let (tx, _client) = entry.get();
-                            log::debug!("received a new upstream id={:?} key={:?}", id, key);
-                            tx.send(Ok(Change::Insert(key, svc))).unwrap();
-                        }
-                        None => {
-                            log::debug!("creating a new load balanced service for the upstream id={:?} key={:?}", id, key);
-                            let (tx, rx) = mpsc::unbounded_channel::<
-                                Result<Change<UpstreamKey, S>, Infallible>,
-                            >();
-                            tx.send(Ok(Change::Insert(key, svc))).unwrap();
-
-                            let balanced_svc =
-                                p2c::Balance::new(Box::pin(UnboundedReceiverStream::new(rx)));
-
-                            upstreams.insert_async(id, (tx, balanced_svc)).await;
-                        }
-                    }
-                }
-                SourceConfigProto::UpstreamRemove(id, key) => {
-                    match upstreams.get_async(&id).await {
-                        Some(entry) => {
-                            let (tx, _client) = entry.get();
-                            tx.send(Ok(Change::Remove(key))).unwrap();
-                        }
-                        None => {
-                            log::warn!("No upstream found with the id: {:?}", id);
-                        }
-                    }
-                }
-            }
-        }
-
-        proxy_handle.await?;
+        handle.await?;
 
         Ok(())
     }
