@@ -22,9 +22,9 @@ async fn main() {
     // create the tcp listener  
     let srv = TcpSource::new("0.0.0.0:8080");
 
-    let proxy = TcpProxy::new("127.0.0.1:8000");
+    let proxy = TcpProxy::new("127.0.0.1:8000".parse().unwrap());
 
-    srv.io_loop(proxy.into_make_service()).await.unwrap();
+    srv.io_loop(proxy).await.unwrap();
 }
 
 // #[tokio::main]
