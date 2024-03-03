@@ -1,30 +1,48 @@
 mod listeners;
 
+use hyper::service::{make_service_fn, service_fn};
+use hyper::{Body, Client, Request, Response, Server};
+use listeners::tcp::{IntoMakeRouteAll, RouteAll, Source, SourceConfigProto, TcpProxy, TcpSource};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::time::Duration;
-use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Client, Request, Response, Server};
-use listeners::tcp::{RouteAll, Source, SourceConfigProto, TcpProxy, TcpSource};
 use tower::load::{CompleteOnResponse, PendingRequests};
 
 // type HttpClient = Client<hyper::client::HttpConnector>;
 
 #[derive(PartialEq, Eq, Hash, Clone, Copy, Debug)]
 enum UpstreamId {
-    DefaultUpstream
+    DefaultUpstream,
+}
+
+impl Default for UpstreamId {
+    fn default() -> Self {
+        UpstreamId::DefaultUpstream
+    }
 }
 
 #[tokio::main]
 async fn main() {
     pretty_env_logger::init();
 
-    // create the tcp listener  
-    let srv = TcpSource::new("0.0.0.0:8080");
+    // create the tcp listener
 
-    let proxy = TcpProxy::new("127.0.0.1:8000".parse().unwrap());
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut srv: TcpSource<_, _, _, _, IntoMakeRouteAll<UpstreamId>> =
+        TcpSource::new("0.0.0.0:8080").config_channel(rx).build();
 
-    srv.io_loop(proxy).await.unwrap();
+    let proxy = PendingRequests::new(
+        TcpProxy::new("127.0.0.1:8000".parse().unwrap()),
+        CompleteOnResponse::default(),
+    );
+    tx.send(SourceConfigProto::UpstreamAdd(
+        UpstreamId::DefaultUpstream,
+        "hello-world-1",
+        proxy,
+    ))
+    .unwrap();
+
+    srv.io_loop().await.unwrap();
 }
 
 // #[tokio::main]
@@ -38,8 +56,8 @@ async fn main() {
 
 //     let make_service = make_service_fn(move |_| {
 //         let client = client.clone();
-//         async move { 
-//             Ok::<_, Infallible>(service_fn(move |req| proxy(client.clone(), req))) 
+//         async move {
+//             Ok::<_, Infallible>(service_fn(move |req| proxy(client.clone(), req)))
 //         }
 //     });
 

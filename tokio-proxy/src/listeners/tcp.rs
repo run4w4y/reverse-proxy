@@ -3,34 +3,21 @@ use std::{
     error::Error,
     fmt::{Debug, Display},
     hash::Hash,
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::SocketAddr,
     pin::Pin,
     sync::Arc,
     task::Poll,
 };
 
-use futures::{
-    channel::mpsc::UnboundedReceiver, future::{self, poll_fn}, pin_mut, stream::FuturesUnordered, Future, FutureExt, Stream, StreamExt, TryFutureExt, TryStream
-};
-use scc::hash_map::{Entry, OccupiedEntry};
-use slab::Slab;
+use futures::{future, Future, FutureExt, TryFutureExt};
+use scc::hash_map::Entry;
 use tokio::{
     io::{copy_bidirectional, AsyncWriteExt},
-    net::{TcpListener, TcpStream, ToSocketAddrs},
-    sync::{
-        mpsc::{self, error::SendError},
-        watch, RwLock,
-    },
+    net::{TcpStream, ToSocketAddrs},
+    sync::{mpsc, watch, Mutex},
 };
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tokio_tower::multiplex::{self, TagStore};
-use tower::{
-    balance::{self, p2c},
-    discover::{Change, Discover, ServiceList},
-    load::{CompleteOnResponse, Load, PendingRequests},
-    make::Shared,
-    BoxError, Layer, MakeService, Service, ServiceBuilder, ServiceExt,
-};
+use tower::{balance::p2c, discover::Change, load::Load, BoxError, Layer, Service, ServiceExt};
 
 #[derive(Debug, Clone)]
 pub enum SourceConfigProto<UpstreamId, UpstreamKey, UpstreamService> {
@@ -57,14 +44,72 @@ pub trait Source<Req, S: Service<Req> + Send, RoutingReq> {
         RoutingS::Future: Send;
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct TcpSource<A> {
-    pub listen_addr: A,
+#[derive(Debug)]
+pub struct TcpSource<
+    Address,
+    UpstreamId: Default,
+    UpstreamKey,
+    Proxy,
+    MakeRouter = IntoMakeRouteAll<UpstreamId>,
+> {
+    pub listen_addr: Address,
+    pub router_rx: watch::Receiver<MakeRouter>,
+    pub config_rx: mpsc::UnboundedReceiver<SourceConfigProto<UpstreamId, UpstreamKey, Proxy>>,
 }
 
-impl<A: ToSocketAddrs> TcpSource<A> {
-    pub fn new(listen_addr: A) -> Self {
-        TcpSource { listen_addr }
+#[derive(Debug)]
+pub struct TcpSourceBuilder<
+    Address,
+    UpstreamId: Default,
+    UpstreamKey,
+    Proxy,
+    MakeRouter = IntoMakeRouteAll<UpstreamId>,
+> {
+    pub listen_addr: Address,
+    pub router_rx: Option<watch::Receiver<MakeRouter>>,
+    pub config_rx:
+        Option<mpsc::UnboundedReceiver<SourceConfigProto<UpstreamId, UpstreamKey, Proxy>>>,
+}
+
+impl<Address: Clone, UpstreamId: Default, UpstreamKey, Proxy, MakeRouter: Default>
+    TcpSourceBuilder<Address, UpstreamId, UpstreamKey, Proxy, MakeRouter>
+{
+    pub fn router_channel(mut self, router_rx: watch::Receiver<MakeRouter>) -> Self {
+        self.router_rx = Some(router_rx);
+        self
+    }
+
+    pub fn config_channel(
+        mut self,
+        config_rx: mpsc::UnboundedReceiver<SourceConfigProto<UpstreamId, UpstreamKey, Proxy>>,
+    ) -> Self {
+        self.config_rx = Some(config_rx);
+        self
+    }
+
+    pub fn build(self) -> TcpSource<Address, UpstreamId, UpstreamKey, Proxy, MakeRouter> {
+        TcpSource {
+            listen_addr: self.listen_addr.clone(),
+            router_rx: self.router_rx.unwrap_or({
+                let (_, rx) = watch::channel(MakeRouter::default());
+                rx
+            }),
+            config_rx: self.config_rx.unwrap(),
+        }
+    }
+}
+
+impl<Address, UpstreamId: Default, UpstreamKey, Proxy, MakeRouter: Default>
+    TcpSource<Address, UpstreamId, UpstreamKey, Proxy, MakeRouter>
+{
+    pub fn new(
+        listen_addr: Address,
+    ) -> TcpSourceBuilder<Address, UpstreamId, UpstreamKey, Proxy, MakeRouter> {
+        TcpSourceBuilder {
+            listen_addr,
+            router_rx: None,
+            config_rx: None,
+        }
     }
 }
 
@@ -107,9 +152,7 @@ impl Service<()> for IntoMakeTcpProxy {
     }
 }
 
-impl<Tag: Send + Sync + 'static> Service<TcpAccept<Tag>>
-    for TcpProxy
-{
+impl<Tag: Send + Sync + 'static> Service<TcpAccept<Tag>> for TcpProxy {
     type Error = std::io::Error;
     type Response = TcpTransferReponse<Tag>;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + Sync>>;
@@ -153,6 +196,14 @@ impl<T> RouteAll<T> {
 #[derive(Debug, Clone)]
 pub struct IntoMakeRouteAll<T> {
     inner: RouteAll<T>,
+}
+
+impl<UpstreamId: Default> Default for IntoMakeRouteAll<UpstreamId> {
+    fn default() -> Self {
+        IntoMakeRouteAll {
+            inner: RouteAll::new(UpstreamId::default()),
+        }
+    }
 }
 
 impl<T: Copy + Send + Sync + 'static> Service<()> for IntoMakeRouteAll<T> {
@@ -231,7 +282,8 @@ where
 {
     type Response = Entry<'a, K, V>;
     type Error = S::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + Sync + 'a>>;
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + Sync + 'a>>;
 
     fn poll_ready(
         &mut self,
@@ -270,60 +322,77 @@ impl<'a, S, K: Eq + Hash, V> Layer<S> for SelectUpstreamLayer<'a, K, V> {
     }
 }
 
-#[derive(PartialEq, Eq, Hash, Clone, Copy, Debug)]
-enum UpstreamId {
-    DefaultUpstream,
-}
+impl<
+        Address: ToSocketAddrs + Display,
+        UpstreamId: Send + Sync + Default + Hash + Eq + Debug + 'static,
+        UpstreamKey: Eq + Hash + Debug + Clone + Send + Sync + 'static,
+        Router: Service<SocketAddr, Response = UpstreamId> + Send + Sync,
+        MakeRouter: Service<(), Response = Router> + Send + Clone + 'static,
+        Proxy: Service<TcpAccept<usize>> + Load + Send + Sync + 'static,
+    > TcpSource<Address, UpstreamId, UpstreamKey, Proxy, MakeRouter>
+where
+    Proxy::Error: Send + Sync + Error + Into<BoxError> + Debug,
+    Proxy::Response: Send + Sync,
+    Proxy::Future: Send + Sync,
+    <Proxy as Load>::Metric: Debug,
+    Router::Error: Send + Sync + Error,
+    Router::Future: Send + Sync,
+    MakeRouter::Error: Debug,
+    MakeRouter::Future: Send + Sync,
+{
+    pub async fn io_loop(&mut self) -> Result<(), anyhow::Error> {
+        let init_router_svc = self.router_rx.borrow().clone();
+        let make_router = Arc::new(Mutex::new(init_router_svc));
 
-impl<A: ToSocketAddrs + Display> TcpSource<A> {
-    pub async fn io_loop<
-        Proxy: Service<TcpAccept<usize>> + Send + Sync + 'static,
-    >(
-        self,
-        proxy: Proxy,
-    ) -> Result<(), anyhow::Error>
-    where
-        Proxy::Error: Send + Sync + Error,
-        Proxy::Response: Send + Sync,
-        Proxy::Future: Send + Sync
-    {
-        let mut make_router = RouteAll::new(UpstreamId::DefaultUpstream).into_make_service();
-
-        let upstreams = Box::new(scc::HashMap::new());
+        let upstreams: Box<
+            scc::HashMap<
+                UpstreamId,
+                (
+                    mpsc::UnboundedSender<Result<Change<UpstreamKey, Proxy>, Infallible>>,
+                    p2c::Balance<
+                        Pin<
+                            Box<
+                                UnboundedReceiverStream<
+                                    Result<Change<UpstreamKey, Proxy>, Infallible>,
+                                >,
+                            >,
+                        >,
+                        TcpAccept<usize>,
+                    >,
+                ),
+            >,
+        > = Box::new(scc::HashMap::new());
         let upstreams_ref = Box::leak::<'static>(upstreams);
-
-        let balanced_make_proxy = p2c::Balance::new(ServiceList::new(vec![
-            PendingRequests::new(proxy, CompleteOnResponse::default()), // this is pretty wrong, since the load handler (?) should be dropped only after the produced service responds
-        ]));
-
-        let _ = upstreams_ref.insert(UpstreamId::DefaultUpstream, balanced_make_proxy);
+        let upstreams_ref = &*upstreams_ref;
 
         let listener = tokio::net::TcpListener::bind(&self.listen_addr).await?;
         log::info!("Listener started on {}", self.listen_addr);
-        
+
+        // let upstreams_clone = upstreams.clone();
         let handle = tokio::spawn(async move {
+            // let upstreams = upstreams_clone;
             while let Ok((inbound, peer_addr)) = listener.accept().await {
-                let accept = TcpAccept {
+                let accept: TcpAccept<usize> = TcpAccept {
                     stream: inbound,
                     addr: peer_addr,
                     tag: 0,
                 };
 
-                let router = make_router.call(()).await.unwrap();
-                let mut route_to_proxy = ServiceBuilder::new()
-                    .layer(SelectUpstreamLayer::new(upstreams_ref))
-                    .service(router);
-                let entry_fut = route_to_proxy.call(peer_addr);
-                
+                let mut make_router_lock = make_router.lock().await;
+                let router_fut = make_router_lock.call(());
+                drop(make_router_lock);
+
                 tokio::spawn(async move {
-                    let entry = entry_fut.await.unwrap();
+                    let mut router = router_fut.await.unwrap();
+                    let upstream = router.call(peer_addr).await.unwrap();
+                    let entry = upstreams_ref.entry(upstream);
 
                     match entry {
                         Entry::Vacant(entry) => {
                             log::error!("no upstream found for: {:?}:", entry.key());
                         }
                         Entry::Occupied(mut proxy_entry) => {
-                            let proxy = proxy_entry.get_mut();
+                            let (_, proxy) = proxy_entry.get_mut();
                             let proxy_fut = proxy.ready().await.unwrap().call(accept);
                             drop(proxy);
                             drop(proxy_entry);
@@ -335,6 +404,47 @@ impl<A: ToSocketAddrs + Display> TcpSource<A> {
                 });
             }
         });
+
+        while let Some(msg) = self.config_rx.recv().await {
+            match msg {
+                SourceConfigProto::Shutdown => {
+                    log::error!("graceful shutdown not yet implemented");
+                }
+                SourceConfigProto::UpstreamAdd(id, key, svc) => {
+                    // NOTE: be careful to not deadlock here
+                    match upstreams_ref.get_async(&id).await {
+                        Some(entry) => {
+                            let (tx, _) = entry.get();
+                            log::debug!("received a new upstream id={:?} key={:?}", id, key);
+                            tx.send(Ok(Change::Insert(key, svc))).unwrap();
+                        }
+                        None => {
+                            log::debug!("creating a new load balanced service for the upstream id={:?} key={:?}", id, key);
+                            let (tx, rx) = mpsc::unbounded_channel::<
+                                Result<Change<UpstreamKey, Proxy>, Infallible>,
+                            >();
+                            tx.send(Ok(Change::Insert(key, svc))).unwrap();
+
+                            let balanced_svc =
+                                p2c::Balance::new(Box::pin(UnboundedReceiverStream::new(rx)));
+
+                            let _ = upstreams_ref.insert_async(id, (tx, balanced_svc)).await;
+                        }
+                    }
+                }
+                SourceConfigProto::UpstreamRemove(id, key) => {
+                    match upstreams_ref.get_async(&id).await {
+                        Some(entry) => {
+                            let (tx, _) = entry.get();
+                            tx.send(Ok(Change::Remove(key))).unwrap();
+                        }
+                        None => {
+                            log::warn!("No upstream found with the id: {:?}", id);
+                        }
+                    }
+                }
+            }
+        }
 
         handle.await?;
 
