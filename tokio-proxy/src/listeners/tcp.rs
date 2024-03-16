@@ -9,7 +9,7 @@ use std::{
     task::Poll,
 };
 
-use futures::{future, Future, FutureExt, TryFutureExt};
+use futures::{future, Future};
 use scc::hash_map::Entry;
 use tokio::{
     io::{copy_bidirectional, AsyncWriteExt},
@@ -17,7 +17,8 @@ use tokio::{
     sync::{mpsc, watch, Mutex},
 };
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tower::{balance::p2c, discover::Change, load::Load, BoxError, Layer, Service, ServiceExt};
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use tower::{balance::p2c, discover::Change, load::Load, BoxError, Service, ServiceExt};
 
 #[derive(Debug, Clone)]
 pub enum SourceConfigProto<UpstreamId, UpstreamKey, UpstreamService> {
@@ -269,58 +270,16 @@ impl<Tag: Copy> Tagged<Tag> for TcpTransferReponse<Tag> {
     }
 }
 
-struct SelectUpstreamService<'a, S, K: Eq + Hash, V> {
-    upstreams: &'a scc::HashMap<K, V>,
-    service: S,
-}
-
-impl<'a, Req, S: Service<Req, Response = K>, K: Eq + Hash + Send + Sync, V: Sync> Service<Req>
-    for SelectUpstreamService<'a, S, K, V>
-where
-    S::Error: Send + Sync + Error + 'a,
-    S::Future: Send + Sync + 'a,
-{
-    type Response = Entry<'a, K, V>;
-    type Error = S::Error;
-    type Future =
-        Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + Sync + 'a>>;
-
-    fn poll_ready(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
-        self.service.poll_ready(cx)
-    }
-
-    fn call(&mut self, req: Req) -> Self::Future {
-        let fut = self
-            .service
-            .call(req)
-            .and_then(|res| self.upstreams.entry_async(res).map(Ok));
-        Box::pin(fut)
-    }
-}
-
-struct SelectUpstreamLayer<'a, K: Eq + Hash, V> {
-    upstreams: &'a scc::HashMap<K, V>,
-}
-
-impl<'a, K: Eq + Hash, V> SelectUpstreamLayer<'a, K, V> {
-    pub fn new(upstreams: &'a scc::HashMap<K, V>) -> Self {
-        SelectUpstreamLayer { upstreams }
-    }
-}
-
-impl<'a, S, K: Eq + Hash, V> Layer<S> for SelectUpstreamLayer<'a, K, V> {
-    type Service = SelectUpstreamService<'a, S, K, V>;
-
-    fn layer(&self, inner: S) -> Self::Service {
-        SelectUpstreamService {
-            service: inner,
-            upstreams: self.upstreams,
-        }
-    }
-}
+type UpstreamStore<Id, Key, Proxy> = scc::HashMap<
+    Id,
+    (
+        mpsc::UnboundedSender<Result<Change<Key, Proxy>, Infallible>>,
+        p2c::Balance<
+            Pin<Box<UnboundedReceiverStream<Result<Change<Key, Proxy>, Infallible>>>>,
+            TcpAccept<usize>,
+        >,
+    ),
+>;
 
 impl<
         Address: ToSocketAddrs + Display,
@@ -340,79 +299,23 @@ where
     MakeRouter::Error: Debug,
     MakeRouter::Future: Send + Sync,
 {
-    pub async fn io_loop(&mut self) -> Result<(), anyhow::Error> {
-        let init_router_svc = self.router_rx.borrow().clone();
-        let make_router = Arc::new(Mutex::new(init_router_svc));
-
-        let upstreams: Box<
-            scc::HashMap<
-                UpstreamId,
-                (
-                    mpsc::UnboundedSender<Result<Change<UpstreamKey, Proxy>, Infallible>>,
-                    p2c::Balance<
-                        Pin<
-                            Box<
-                                UnboundedReceiverStream<
-                                    Result<Change<UpstreamKey, Proxy>, Infallible>,
-                                >,
-                            >,
-                        >,
-                        TcpAccept<usize>,
-                    >,
-                ),
-            >,
-        > = Box::new(scc::HashMap::new());
-        let upstreams_ref = Box::leak::<'static>(upstreams);
-        let upstreams_ref = &*upstreams_ref;
-
-        let listener = tokio::net::TcpListener::bind(&self.listen_addr).await?;
-        log::info!("Listener started on {}", self.listen_addr);
-
-        // let upstreams_clone = upstreams.clone();
-        let handle = tokio::spawn(async move {
-            // let upstreams = upstreams_clone;
-            while let Ok((inbound, peer_addr)) = listener.accept().await {
-                let accept: TcpAccept<usize> = TcpAccept {
-                    stream: inbound,
-                    addr: peer_addr,
-                    tag: 0,
-                };
-
-                let mut make_router_lock = make_router.lock().await;
-                let router_fut = make_router_lock.call(());
-                drop(make_router_lock);
-
-                tokio::spawn(async move {
-                    let mut router = router_fut.await.unwrap();
-                    let upstream = router.call(peer_addr).await.unwrap();
-                    let entry = upstreams_ref.entry(upstream);
-
-                    match entry {
-                        Entry::Vacant(entry) => {
-                            log::error!("no upstream found for: {:?}:", entry.key());
-                        }
-                        Entry::Occupied(mut proxy_entry) => {
-                            let (_, proxy) = proxy_entry.get_mut();
-                            let proxy_fut = proxy.ready().await.unwrap().call(accept);
-                            drop(proxy);
-                            drop(proxy_entry);
-                            if let Err(e) = proxy_fut.await {
-                                log::error!("error when proxying: {:?}", e);
-                            }
-                        }
-                    }
-                });
-            }
-        });
-
+    async fn poll_config_task(
+        &mut self,
+        upstreams: Arc<UpstreamStore<UpstreamId, UpstreamKey, Proxy>>,
+        connection_tracker: Arc<TaskTracker>,
+        token: CancellationToken,
+    ) -> Result<(), anyhow::Error> {
         while let Some(msg) = self.config_rx.recv().await {
             match msg {
                 SourceConfigProto::Shutdown => {
-                    log::error!("graceful shutdown not yet implemented");
+                    log::info!("Received a shutdown signal");
+                    connection_tracker.close();
+                    token.cancel();
+                    break;
                 }
                 SourceConfigProto::UpstreamAdd(id, key, svc) => {
                     // NOTE: be careful to not deadlock here
-                    match upstreams_ref.get_async(&id).await {
+                    match upstreams.get_async(&id).await {
                         Some(entry) => {
                             let (tx, _) = entry.get();
                             log::debug!("received a new upstream id={:?} key={:?}", id, key);
@@ -428,12 +331,12 @@ where
                             let balanced_svc =
                                 p2c::Balance::new(Box::pin(UnboundedReceiverStream::new(rx)));
 
-                            let _ = upstreams_ref.insert_async(id, (tx, balanced_svc)).await;
+                            let _ = upstreams.insert_async(id, (tx, balanced_svc)).await;
                         }
                     }
                 }
                 SourceConfigProto::UpstreamRemove(id, key) => {
-                    match upstreams_ref.get_async(&id).await {
+                    match upstreams.get_async(&id).await {
                         Some(entry) => {
                             let (tx, _) = entry.get();
                             tx.send(Ok(Change::Remove(key))).unwrap();
@@ -445,8 +348,78 @@ where
                 }
             }
         }
+        Ok(())
+    }
 
-        handle.await?;
+    pub async fn io_loop(&mut self) -> Result<(), anyhow::Error> {
+        let init_router_svc = self.router_rx.borrow().clone();
+        let make_router = Arc::new(Mutex::new(init_router_svc));
+
+        let upstreams: Arc<UpstreamStore<UpstreamId, UpstreamKey, Proxy>> =
+            Arc::new(scc::HashMap::new());
+
+        let connection_tracker = Arc::new(TaskTracker::new());
+        let token = CancellationToken::new();
+
+        let listener = tokio::net::TcpListener::bind(&self.listen_addr).await?;
+        log::info!("Listener started on {}", self.listen_addr);
+
+        let upstreams_clone = upstreams.clone();
+        let connection_tracker_clone = connection_tracker.clone();
+        let child_token = token.child_token();
+        let accept_task_handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    
+                    () = child_token.cancelled() => {
+                        break;
+                    },
+                    res = listener.accept() => match res {
+                        Ok((inbound, peer_addr)) => {
+                            let accept: TcpAccept<usize> = TcpAccept {
+                                stream: inbound,
+                                addr: peer_addr,
+                                tag: 0,
+                            };
+            
+                            let mut make_router_lock = make_router.lock().await;
+                            let router_fut = make_router_lock.call(());
+                            drop(make_router_lock);
+            
+                            let upstreams_clone = upstreams_clone.clone();
+                            connection_tracker_clone.spawn(async move {
+                                let mut router = router_fut.await.unwrap();
+                                let upstream = router.call(peer_addr).await.unwrap();
+                                let entry = upstreams_clone.entry(upstream);
+            
+                                match entry {
+                                    Entry::Vacant(entry) => {
+                                        log::error!("no upstream found for: {:?}:", entry.key());
+                                    }
+                                    Entry::Occupied(mut proxy_entry) => {
+                                        let (_, proxy) = proxy_entry.get_mut();
+                                        let proxy_fut = proxy.ready().await.unwrap().call(accept);
+                                        drop(proxy);
+                                        drop(proxy_entry);
+                                        if let Err(e) = proxy_fut.await {
+                                            log::error!("error when proxying: {:?}", e);
+                                        }
+                                    }
+                                }
+                            });
+                        },
+                        Err(_) => {
+                            break;
+                        },
+                    },
+                }
+            }
+        });
+
+        self.poll_config_task(upstreams.clone(), connection_tracker.clone(), token).await?;
+        accept_task_handle.await?;
+        connection_tracker.wait().await; // wait for all the pending connections to complete
 
         Ok(())
     }

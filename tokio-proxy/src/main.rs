@@ -7,6 +7,7 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tower::load::{CompleteOnResponse, PendingRequests};
+use tokio::signal::unix::{signal, SignalKind};
 
 // type HttpClient = Client<hyper::client::HttpConnector>;
 
@@ -41,6 +42,20 @@ async fn main() {
         proxy,
     ))
     .unwrap();
+
+    tokio::spawn(async move {
+        let mut sigterm = signal(SignalKind::terminate()).unwrap();
+        let mut sigint = signal(SignalKind::interrupt()).unwrap();
+
+        tokio::select! {
+            _ = sigterm.recv() => {
+                tx.send(SourceConfigProto::Shutdown).unwrap();
+            },
+            _ = sigint.recv() => {
+                tx.send(SourceConfigProto::Shutdown).unwrap();
+            },
+        }
+    });
 
     srv.io_loop().await.unwrap();
 }

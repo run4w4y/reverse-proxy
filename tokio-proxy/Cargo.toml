@@ -21,3 +21,4 @@ tokio-stream = "0.1.14"
 scc = "2.0.16"
 slab = "0.4.9"
 async-channel = "2.2.0"
+tokio-util = { version = "0.7.10", features = ["rt"] }
