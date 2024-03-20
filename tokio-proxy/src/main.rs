@@ -1,13 +1,19 @@
-mod listeners;
+mod application;
+mod proxy;
+mod routing;
+mod server;
 
-use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Client, Request, Response, Server};
-use listeners::tcp::{IntoMakeRouteAll, RouteAll, Source, SourceConfigProto, TcpProxy, TcpSource};
-use std::convert::Infallible;
-use std::net::SocketAddr;
-use std::time::Duration;
+use application::Application;
+// use hyper::service::{make_service_fn, service_fn};
+// use hyper::{Body, Client, Request, Response, Server};
+use proxy::{http::HttpProxy, tcp::TcpProxy};
+use routing::RouteAll;
+use server::{h1::HttpServerBuilder, tcp::TcpServerBuilder, UpstreamChange};
+// use std::convert::Infallible;
+// use std::net::SocketAddr;
+// use std::time::Duration;
+use tokio::sync::watch;
 use tower::load::{CompleteOnResponse, PendingRequests};
-use tokio::signal::unix::{signal, SignalKind};
 
 // type HttpClient = Client<hyper::client::HttpConnector>;
 
@@ -16,48 +22,32 @@ enum UpstreamId {
     DefaultUpstream,
 }
 
-impl Default for UpstreamId {
-    fn default() -> Self {
-        UpstreamId::DefaultUpstream
-    }
-}
-
 #[tokio::main]
 async fn main() {
     pretty_env_logger::init();
 
-    // create the tcp listener
-
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut srv: TcpSource<_, _, _, _, IntoMakeRouteAll<UpstreamId>> =
-        TcpSource::new("0.0.0.0:8080").config_channel(rx).build();
+    let srv = HttpServerBuilder::default()
+        .bind("0.0.0.0:8080")
+        .router_channel(
+            watch::channel(RouteAll::new(UpstreamId::DefaultUpstream).into_make_service()).1,
+        )
+        .upstreams_channel(rx)
+        .build()
+        .unwrap();
 
     let proxy = PendingRequests::new(
-        TcpProxy::new("127.0.0.1:8000".parse().unwrap()),
+        HttpProxy::new("127.0.0.1:8000".parse().unwrap()),
         CompleteOnResponse::default(),
     );
-    tx.send(SourceConfigProto::UpstreamAdd(
+    tx.send(UpstreamChange::Add(
         UpstreamId::DefaultUpstream,
         "hello-world-1",
         proxy,
     ))
     .unwrap();
 
-    tokio::spawn(async move {
-        let mut sigterm = signal(SignalKind::terminate()).unwrap();
-        let mut sigint = signal(SignalKind::interrupt()).unwrap();
-
-        tokio::select! {
-            _ = sigterm.recv() => {
-                tx.send(SourceConfigProto::Shutdown).unwrap();
-            },
-            _ = sigint.recv() => {
-                tx.send(SourceConfigProto::Shutdown).unwrap();
-            },
-        }
-    });
-
-    srv.io_loop().await.unwrap();
+    Application::new().server(srv).serve_all().await;
 }
 
 // #[tokio::main]
