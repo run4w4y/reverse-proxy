@@ -3,7 +3,11 @@ mod proxy;
 mod routing;
 mod server;
 
+use std::convert::Infallible;
+
 use application::Application;
+use futures::future;
+use http::HeaderValue;
 // use hyper::service::{make_service_fn, service_fn};
 // use hyper::{Body, Client, Request, Response, Server};
 use proxy::{http::HttpProxy, tcp::TcpProxy};
@@ -13,7 +17,10 @@ use server::{h1::HttpServerBuilder, tcp::TcpServerBuilder, UpstreamChange};
 // use std::net::SocketAddr;
 // use std::time::Duration;
 use tokio::sync::watch;
-use tower::load::{CompleteOnResponse, PendingRequests};
+use tower::{
+    load::{CompleteOnResponse, PendingRequests},
+    service_fn,
+};
 
 // type HttpClient = Client<hyper::client::HttpConnector>;
 
@@ -27,11 +34,24 @@ async fn main() {
     pretty_env_logger::init();
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let router_svc = service_fn(|mut req_info: http::request::Parts| {
+        if let Some(host) = req_info.headers.get("Host") {
+            log::info!("Host header: {:?}", host);
+            if *host == "foo.localhost".parse::<HeaderValue>().unwrap() {
+                log::info!("foo match");
+                req_info.uri = "/foo".parse().unwrap();
+            } else if *host == "bar.localhost".parse::<HeaderValue>().unwrap() {
+                log::info!("bar match");
+                req_info.uri = "/bar".parse().unwrap();
+            }
+        }
+
+        future::ready(Ok::<_, Infallible>(UpstreamId::DefaultUpstream))
+    });
+    let (router_tx, router_rx) = watch::channel(router_svc);
     let srv = HttpServerBuilder::default()
         .bind("0.0.0.0:8080")
-        .router_channel(
-            watch::channel(RouteAll::new(UpstreamId::DefaultUpstream).into_make_service()).1,
-        )
+        .router_channel(router_rx)
         .upstreams_channel(rx)
         .build()
         .unwrap();

@@ -1,6 +1,6 @@
 use std::{convert::Infallible, error::Error, hash::Hash, pin::Pin, sync::Arc, fmt::Debug};
 
-use tokio::sync::{mpsc, watch, Mutex};
+use tokio::sync::{mpsc, watch, Mutex, RwLock};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tower::{balance::p2c, discover::Change, load::Load, BoxError, Service};
 
@@ -70,12 +70,18 @@ pub async fn poll_router_changes<MakeRouter: Clone>(
     router_rx: &mut watch::Receiver<MakeRouter>,
     make_router: Arc<Mutex<MakeRouter>>
 ) -> () {
-    loop {
-        if router_rx.changed().await.is_ok() {
-            let mut lock = make_router.lock().await;
-            *lock = router_rx.borrow().clone();
-        } else {
-            break;
-        }
+    while let Ok(()) = router_rx.changed().await {
+        let mut lock = make_router.lock().await;
+        *lock = router_rx.borrow().clone();
+    }
+}
+
+pub async fn poll_router_changes_rw_lock<MakeRouter: Clone>(
+    router_rx: &mut watch::Receiver<MakeRouter>,
+    make_router: Arc<RwLock<MakeRouter>>
+) -> () {
+    while let Ok(()) = router_rx.changed().await {
+        let mut lock = make_router.write().await;
+        *lock = router_rx.borrow().clone();
     }
 }
