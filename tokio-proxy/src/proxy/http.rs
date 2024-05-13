@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use futures::Future;
+use futures::{Future, TryFutureExt};
 use http::{Request, Response, Uri};
 use http_body_util::{combinators::BoxBody, BodyExt};
 use hyper::body::Incoming;
@@ -53,25 +53,21 @@ impl Service<Request<Incoming>> for HttpProxy {
     }
 
     fn call(&mut self, mut req: Request<Incoming>) -> Self::Future {
-        let host = self.target_host.clone();
-        let client = self.client.clone();
+        let uri = Uri::builder()
+            .scheme("http")
+            .authority(self.target_host.as_str())
+            .path_and_query(
+                req.uri()
+                    .path_and_query()
+                    .map(|x| x.as_str())
+                    .unwrap_or("/"),
+            )
+            .build()
+            .unwrap();
+        *req.uri_mut() = uri;
 
-        Box::pin(async move {
-            let uri = Uri::builder()
-                .scheme("http")
-                .authority(host)
-                .path_and_query(
-                    req.uri()
-                        .path_and_query()
-                        .map(|x| x.as_str())
-                        .unwrap_or("/"),
-                )
-                .build()
-                .unwrap();
-            *req.uri_mut() = uri;
+        let fut = self.client.request(req).map_ok(|resp| resp.map(|b| b.boxed()));
 
-            let resp = client.request(req).await?;
-            Ok(resp.map(|b| b.boxed()))
-        })
+        Box::pin(fut)
     }
 }

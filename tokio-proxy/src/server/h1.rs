@@ -3,17 +3,12 @@ use std::{
     error::Error,
     fmt::{Debug, Display},
     hash::Hash,
-    net::SocketAddr,
-    ops::Add,
-    pin::Pin,
     sync::Arc,
-    task::{Context, Poll},
 };
 
 use bytes::Bytes;
 use derive_builder::Builder;
-use futures::{future, Future, FutureExt, TryFutureExt};
-use http::{request::Parts, Request, Response, StatusCode};
+use http::{request::Parts, HeaderName, Request, Response, StatusCode};
 use http_body_util::{combinators::BoxBody, BodyExt, Empty};
 use hyper::{
     body::{Body, Incoming},
@@ -26,7 +21,7 @@ use tokio::{
     sync::{mpsc, watch, RwLock},
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
-use tower::{load::Load, BoxError, Layer, Service, ServiceExt};
+use tower::{load::Load, BoxError, Layer, Service, ServiceBuilder, ServiceExt};
 
 use crate::server::util::{poll_router_changes_rw_lock, poll_upstream_changes};
 
