@@ -3,19 +3,76 @@ mod proxy;
 mod routing;
 mod server;
 
+use std::sync::Arc;
+
 use application::Application;
-use proxy::{http::HttpProxy, tcp::TcpProxy};
-use routing::RouteAll;
-use server::{h1::HttpServerBuilder, tcp::TcpServerBuilder, UpstreamChange};
-use tokio::sync::watch;
-use tower::{
-    load::{CompleteOnResponse, PendingRequests},
-    service_fn,
+use axum::{
+    extract::State,
+    routing::{delete, put},
+    Json, Router,
 };
+use http::StatusCode;
+use proxy::http::HttpProxy;
+use routing::RouteAll;
+use serde::{Deserialize, Serialize};
+use server::{axum::AxumServerBuilder, h1::HttpServerBuilder, UpstreamChange};
+use tokio::sync::{mpsc::UnboundedSender, watch};
+use tower::load::{CompleteOnResponse, PendingRequests};
 
 #[derive(PartialEq, Eq, Hash, Clone, Copy, Debug)]
 enum UpstreamId {
     DefaultUpstream,
+}
+
+#[derive(Clone)]
+struct AppState {
+    upstream_tx: UnboundedSender<UpstreamChange<UpstreamId, String, PendingRequests<HttpProxy>>>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct AddUpstream {
+    target: String,
+    key: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RemoveUpstream {
+    key: String,
+}
+
+async fn add_upstream_route(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<AddUpstream>,
+) -> StatusCode {
+    let proxy = PendingRequests::new(
+        HttpProxy::new(payload.target),
+        CompleteOnResponse::default(),
+    );
+    let res = state.upstream_tx.send(UpstreamChange::Add(
+        UpstreamId::DefaultUpstream,
+        payload.key,
+        proxy,
+    ));
+
+    match res {
+        Ok(_) => StatusCode::CREATED,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+async fn remove_upstream_route(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<RemoveUpstream>,
+) -> StatusCode {
+    let res = state.upstream_tx.send(UpstreamChange::Remove(
+        UpstreamId::DefaultUpstream,
+        payload.key,
+    ));
+
+    match res {
+        Ok(_) => StatusCode::OK,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
 }
 
 #[tokio::main]
@@ -33,28 +90,20 @@ async fn main() {
         .build()
         .unwrap();
 
-    let hostnames = vec![
-        "hello-world-1".to_string(),
-        "hello-world-2".to_string(),
-        "hello-world-3".to_string()
-    ];
-
-    for hostname in hostnames {
-        // let address = resolver.lookup_ip(*hostname).unwrap();
-        let target = format!("{hostname}:8000");
-
-        let proxy = PendingRequests::new(
-            HttpProxy::new(target),
-            CompleteOnResponse::default(),
-        );
-    
-        tx.send(UpstreamChange::Add(
-            UpstreamId::DefaultUpstream,
-            hostname,
-            proxy,
-        ))
+    let axum_state = Arc::new(AppState { upstream_tx: tx });
+    let axum_app = Router::new()
+        .route("/upstreams", put(add_upstream_route))
+        .route("/upstreams", delete(remove_upstream_route))
+        .with_state(axum_state);
+    let axum_srv = AxumServerBuilder::default()
+        .bind("0.0.0.0:8999")
+        .router(axum_app)
+        .build()
         .unwrap();
-    }
 
-    Application::new().server(srv).serve_all().await;
+    Application::new()
+        .server(axum_srv)
+        .server(srv)
+        .serve_all()
+        .await;
 }
